@@ -1,6 +1,7 @@
 from scsiio.common import SCSIException
 from jltech.uboot import JL_MSCDevice, JL_UBOOT, JL_LoaderV2, JL_LoaderV1
 from jltech.cipher import cipher_bytes, jl_crc_cipher, jl_rxgp_cipher
+from jltech.memio import MEM_IO_CHUNK, rom_cipher, MemReadError, read_chunks, write_chunks
 from jltech.utils import *
 
 from scsiio import SCSIDev
@@ -9,6 +10,7 @@ from tqdm import tqdm
 from pathlib import Path
 
 import argparse
+import sys
 import cmd
 import yaml
 
@@ -33,12 +35,22 @@ ap.add_argument('--loader-arg', type=anyint, metavar='ARG',
                 help="Loader's argument (overrides one set with the '--arg-xxx' arguments above)."
                      " '--arg-target' defines bits 0-3, '--arg-clkdiv' defines bits 4-11 and '--arg-spimode' defines bits 12-13.")
 
+ap.add_argument('--no-loader', action='store_true',
+                help='Do not install the loader. The mask ROM only does memory read/write/jump'
+                     ' (FD07/FB06/FB08), so the shell is limited to memread/memdump/memwrite/memjump,'
+                     ' and memory data is descrambled when the chip scrambles it.')
+
+ap.add_argument('--raw', action='store_true',
+                help='With --no-loader: do not descramble memory data. Use it when a loader is'
+                     ' already resident in this power cycle, since it answers FD07 with plain bytes.')
+
 ap.add_argument('cmds', nargs='*',
                 help='Commands to run (as if they were typed into an interactive shell).'
                      ' The shell itself is not going to be executed if the commands were specified there.'
                      ' Finally a solution for using it in automated build enviroments! (sort of)')
 
-args = ap.parse_args()
+def parse_args(argv=None):
+    return ap.parse_args(argv)
 
 ###############################################################################
 
@@ -80,18 +92,40 @@ class DasShell(cmd.Cmd):
     """
     prompt = '=>JL: '
 
-    def __init__(self, dev):
+    def __init__(self, dev, rom=False, cipher=None):
         super(DasShell, self).__init__()
         self.dev = dev
+
+        # `rom`: only the mask ROM's memory read/write/jump exist, so the
+        # flash commands must refuse.  `cipher`: the scrambling to undo on every
+        # memory transfer (the memory-rw-mengli-crypt quirk), or None.
+        self.rom = rom
+        self.cipher = cipher
 
         try:
             self.flash_io_max = self.dev.usb_buffer_size()
         except:
             self.flash_io_max = 512
 
-        # FIXME: new loaders (br23+) use a very small buffer (just 256 bytes long) for *all* I/O,
-        #  and the memory operations will happily overwrite past this buffer, while the flash I/O won't.
-        self.mem_io_max = 256
+        self.mem_io_max = MEM_IO_CHUNK
+
+    #------#------#------#------#------#------#------#------#------#------#
+
+    def _needs_loader(self, cmd):
+        """Refuse a flash command in ROM mode instead of failing on the wire."""
+        if not self.rom:
+            return False
+        print('%s needs the loader: the mask ROM only does memory read/write/jump'
+              ' (memread/memdump/memwrite/memjump). Drop --no-loader to install it.' % cmd)
+        return True
+
+    def mem_read(self, addr, length):
+        return read_chunks(self.dev.mem_read, addr, length, self.mem_io_max,
+                           self.cipher)
+
+    def mem_write(self, addr, data):
+        return write_chunks(self.dev.mem_write, addr, data, self.mem_io_max,
+                            self.cipher)
 
 
     def emptyline(self):
@@ -108,6 +142,9 @@ class DasShell(cmd.Cmd):
         """ Burn the chipkey into the chip
         burnchipkey <key>
         """
+
+        if self._needs_loader('burnchipkey'):
+            return
 
         args = args.split(maxsplit=1)
 
@@ -270,6 +307,9 @@ class DasShell(cmd.Cmd):
 #        <length> can be 0 to dump whole flash (size aligned to the address used)
 #        """
 
+        if self._needs_loader('read'):
+            return
+
         args = args.split(maxsplit=2)
 
         if len(args) < 3:
@@ -304,6 +344,9 @@ class DasShell(cmd.Cmd):
         """Write file to flash.
         write <address> <file>
         """
+
+        if self._needs_loader('write'):
+            return
 
         args = args.split(maxsplit=1)
 
@@ -341,6 +384,9 @@ class DasShell(cmd.Cmd):
         Warning: may not always work!
         """
 
+        if self._needs_loader('erasechip'):
+            return
+
         self.dev.flash_erase_chip()
 
     def do_erase(self, args):
@@ -355,6 +401,9 @@ class DasShell(cmd.Cmd):
 #        If only the <address> is specified, then everything starting from
 #         that address will be erased. (the same works when <length> specified as 0)
 #        """
+
+        if self._needs_loader('erase'):
+            return
 
         args = args.split(maxsplit=2)
 
@@ -389,6 +438,9 @@ class DasShell(cmd.Cmd):
 
         If <length> is not specified, then it will default to 256 bytes.
         """
+
+        if self._needs_loader('dump'):
+            return
 
         args = args.split(maxsplit=2)
 
@@ -452,15 +504,11 @@ class DasShell(cmd.Cmd):
             return
 
         with fil:
-            while length > 0:
-                n = min(length, self.mem_io_max)
-
-                data = self.dev.mem_read(address, n)
-
-                fil.write(data)
-
-                length -= n
-                address += n
+            try:
+                fil.write(self.mem_read(address, length))
+            except MemReadError as e:
+                fil.write(e.data)
+                print("!! %s (%d byte(s) kept)" % (e, len(e.data)))
 
     #-------------------------------------
 
@@ -493,15 +541,7 @@ class DasShell(cmd.Cmd):
             length = fil.tell()
             fil.seek(0)
 
-            while length > 0:
-                block = fil.read(self.mem_io_max)
-                if block == b'': break
-                n = len(block)
-
-                self.dev.mem_write(address, block)
-
-                length -= n
-                address += n
+            self.mem_write(address, fil.read())
 
     #-------------------------------------
 
@@ -533,20 +573,21 @@ class DasShell(cmd.Cmd):
             print("<length> [%s] is not a number!" % args[1])
             return
 
-        while length > 0:
-            n = min(length, self.mem_io_max)
+        try:
+            data = self.mem_read(address, length)
+        except MemReadError as e:
+            hexdump(e.data, base=address)
+            print("!! %s (%d of %d byte(s) shown)" % (e, len(e.data), length))
+            return
 
-            hexdump(self.dev.mem_read(address, n), base=address)
-
-            address += n
-            length -= n
+        hexdump(data, base=address)
 
     #-------------------------------------
 
     def do_memjump(self, args):
         """Execute code at a given address
         memjump <addr> [<arg>]
-        
+
         [<arg>] specifies an 16-bit integer which is passed to the
         code in its loader parameters structure, if any is supported by the chip or its loader.
         If it is not specified, it defaults to 0
@@ -588,6 +629,9 @@ class DasShell(cmd.Cmd):
         If <arg> is not specified, then it will default to 1.
         """
 
+        if self._needs_loader('reset'):
+            return
+
         args = args.split(maxsplit=2)
 
         try:
@@ -628,143 +672,198 @@ dev_type_strs = {
 }
 
 
-if args.device is not None:
-    # use the provided device path
-    devpath = args.device
 
-else:
-    # find and ask about the device to use
-    from jldevfind import choose_jl_device
+def pick_mode(args, chipspec, product):
+    """Pick the mode and the memory scrambling.
 
-    if args.chip is not None:
-        filter = get_chip_name(args.chip)
-        if filter is None:
-            print(f'Unknown chip "{args.chip}"')
-            exit(1)
+    Returns (install_loader, rom_mode, mem_cipher); exits on a combination that
+    cannot work instead of doing the wrong thing quietly.
+    """
+    in_uboot1 = product == 'UBOOT1.00'
+
+    if args.no_loader and not in_uboot1:
+        print(f'!! --no-loader needs UBOOT1.00; this device reports "{product}".'
+              ' It only skips the *loader* install, it does not replace one.')
+        exit(4)
+
+    if args.raw and not args.no_loader:
+        print('!! --raw only applies to --no-loader; the loader answers in plain bytes already.')
+        exit(4)
+
+    rom_mode = in_uboot1 and args.no_loader
+    mem_cipher = None
+
+    if rom_mode:
+        quirk = chipspec.get('uboot1.00', {}).get('quirks', {})
+        scrambled = quirk.get('memory-rw-mengli-crypt') == True
+
+        # The quirk is a property of the chip, not a choice; a resident loader
+        # answers in plain, hence --raw.
+        mem_cipher = rom_cipher if (scrambled and not args.raw) else None
+
+    return (in_uboot1 and not args.no_loader), rom_mode, mem_cipher
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    if args.device is not None:
+        # use the provided device path
+        devpath = args.device
+
     else:
-        filter = None
+        # find and ask about the device to use
+        from jldevfind import choose_jl_device
 
-    devpath = choose_jl_device(venfilter=filter)
-    if devpath is None:
-        exit(1)
-
-
-
-with JL_MSCDevice(devpath) as dev:
-    vendor, product, prodrev = dev.inquiry()
-
-    chipname = vendor.lower()
-    if chipname not in JL_chips:
-        print(f'"{chipname}" is not supported or it is not a JieLi chip.')
-        exit(2)
-
-    print()
-
-    chipspec = JL_chips[chipname]
-    print(f'Chip: {chipname.upper()} - {"/".join(chipspec["name"])} series')
-
-    #---------------------------
-
-    loader = JL_UBOOT(dev.dev)
-
-    runtheloader = False
-
-    if product == 'UBOOT1.00':
-        runtheloader = True
-
-    if runtheloader:
-        if chipname not in JL_usb_loaders:
-            print(f'No loader available for "{chipname}".')
-            exit(3)
-
-        spec = JL_usb_loaders[chipname]
-
-        menglicrypt = False
-
-        with open(dataroot / spec['file'], 'rb') as f:
-            block_size = spec.get('blocksize', 512)
-            cipher = spec.get('encryption', 'none')
-
-            # does this chip's UBOOT1.00 accept data in mengli encrypted form?
-            if 'uboot1.00' in chipspec:
-                if 'quirks' in chipspec['uboot1.00']:
-                    menglicrypt = chipspec['uboot1.00']['quirks'].get('memory-rw-mengli-crypt') == True
-
-            # shall we ever perform the mengli de/encryption?
-            menglicrypt = (not menglicrypt and cipher == 'MengLi') or (menglicrypt and cipher != 'MengLi')
-
-            # upload the loader
-            address = spec['address']
-
-            while True:
-                block = f.read(block_size)
-                if block == b'': break
-
-                if cipher == 'RxGp':
-                    # just pass it into the dedicated memory write command
-                    loader.mem_write_rxgp(address, block)
-
-                else:
-                    if menglicrypt:
-                        # scramble with crc_cipher
-                        block = cipher_bytes(jl_crc_cipher, block)
-
-                    loader.mem_write(address, block)
-
-                address += len(block)
-
-
-        if args.loader_arg is not None:
-            spec['argument'] = args.loader_arg
+        if args.chip is not None:
+            filter = get_chip_name(args.chip)
+            if filter is None:
+                print(f'Unknown chip "{args.chip}"')
+                exit(1)
         else:
-            spec['argument'] = (args.arg_spimode << 12) | (args.arg_clkdiv << 4) | args.arg_target
+            filter = None
 
-        print(f'Running loader with argument 0x{spec["argument"]:04X}.')
+        devpath = choose_jl_device(venfilter=filter)
+        if devpath is None:
+            exit(1)
 
-        try:
-            loader.mem_jump(spec['address'], spec['argument'])
-            print('The Loader has been successfully installed.')
-        except SCSIException:
-            print("!! Failed to run the loader !!")
-            exit(3)
 
-    loader = JL_LoaderV2(dev.dev)
 
-    #
-    # Print some quick info summary
-    #
+    with JL_MSCDevice(devpath) as dev:
+        vendor, product, prodrev = dev.inquiry()
 
-    print()
-    print('================ Quick info ==================')
-    print('  ** %s (%s series) **' % (chipname.upper(), '/'.join(chipspec['name'])))  # redundant?
+        chipname = vendor.lower()
+        if chipname not in JL_chips:
+            print(f'"{chipname}" is not supported or it is not a JieLi chip.')
+            exit(2)
 
-    try:
-        print('  >> Chip key: 0x%04X <<' % loader.chip_key())
-    except Exception:
-        print('  ** failed to get the chip key **')
+        print()
 
-    try:
-        ondev = loader.online_device()
-        print('  - Online device:')
-        print('     ID: 0x%06x' % ondev['id'])
-        print('     Type: 0x%02x (%s)' % (ondev['type'], dev_type_strs.get(ondev['type'], 'unknown')))
-    except Exception:
-        print('  ** failed to get the online device info **')
+        chipspec = JL_chips[chipname]
+        print(f'Chip: {chipname.upper()} - {"/".join(chipspec["name"])} series')
 
-    print('==============================================')
+        #---------------------------
 
-    #
-    # Let's enter the shell!
-    #
-    ds = DasShell(loader)
+        loader = JL_UBOOT(dev.dev)
 
-    if len(args.cmds) > 0:
-        # just execute commands in order
-        for cmd in args.cmds:
-            if ds.onecmd(cmd):
-                if not any(cmd.strip().startswith(x) for x in ['reset', 'exit']):
-                    print('**** interrupted ****')
-                break
-    else:
-        # enter the shell
-        ds.cmdloop()
+        runtheloader, rom_mode, mem_cipher = pick_mode(args, chipspec, product)
+
+        if rom_mode:
+            print('ROM mode: no loader installed. Memory read/write/jump only;'
+                  ' data %s.' % ('descrambled (memory-rw-mengli-crypt)' if mem_cipher
+                                 else 'raw (--raw, or the chip does not scramble)'))
+
+        if runtheloader:
+            if chipname not in JL_usb_loaders:
+                print(f'No loader available for "{chipname}".')
+                exit(3)
+
+            spec = JL_usb_loaders[chipname]
+
+            menglicrypt = False
+
+            with open(dataroot / spec['file'], 'rb') as f:
+                block_size = spec.get('blocksize', 512)
+                cipher = spec.get('encryption', 'none')
+
+                # does this chip's UBOOT1.00 accept data in mengli encrypted form?
+                if 'uboot1.00' in chipspec:
+                    if 'quirks' in chipspec['uboot1.00']:
+                        menglicrypt = chipspec['uboot1.00']['quirks'].get('memory-rw-mengli-crypt') == True
+
+                # shall we ever perform the mengli de/encryption?
+                menglicrypt = (not menglicrypt and cipher == 'MengLi') or (menglicrypt and cipher != 'MengLi')
+
+                # upload the loader
+                address = spec['address']
+
+                while True:
+                    block = f.read(block_size)
+                    if block == b'': break
+
+                    if cipher == 'RxGp':
+                        # just pass it into the dedicated memory write command
+                        loader.mem_write_rxgp(address, block)
+
+                    else:
+                        if menglicrypt:
+                            # scramble with crc_cipher
+                            block = cipher_bytes(jl_crc_cipher, block)
+
+                        loader.mem_write(address, block)
+
+                    address += len(block)
+
+
+            if args.loader_arg is not None:
+                spec['argument'] = args.loader_arg
+            else:
+                spec['argument'] = (args.arg_spimode << 12) | (args.arg_clkdiv << 4) | args.arg_target
+
+            print(f'Running loader with argument 0x{spec["argument"]:04X}.')
+
+            try:
+                loader.mem_jump(spec['address'], spec['argument'])
+                print('The Loader has been successfully installed.')
+            except SCSIException:
+                print("!! Failed to run the loader !!")
+                exit(3)
+
+        if rom_mode:
+            # Chipkey (FC09) and online device (FC0A) are loader commands, so
+            # the summary prints the ROM's command set instead.
+            print()
+            print('================ Quick info (mask ROM) ===============')
+            print('  ** %s (%s series) **' % (chipname.upper(), '/'.join(chipspec['name'])))
+            print('  - Commands: memread/memdump/memwrite/memjump.')
+            print('=====================================================')
+            shell_dev = JL_UBOOT(dev.dev)
+        else:
+            loader = JL_LoaderV2(dev.dev)
+
+            #
+            # Print some quick info summary
+            #
+
+            print()
+            print('================ Quick info ==================')
+            print('  ** %s (%s series) **' % (chipname.upper(), '/'.join(chipspec['name'])))  # redundant?
+
+            try:
+                print('  >> Chip key: 0x%04X <<' % loader.chip_key())
+            except Exception:
+                print('  ** failed to get the chip key **')
+
+            try:
+                ondev = loader.online_device()
+                print('  - Online device:')
+                print('     ID: 0x%06x' % ondev['id'])
+                print('     Type: 0x%02x (%s)' % (ondev['type'], dev_type_strs.get(ondev['type'], 'unknown')))
+            except Exception:
+                print('  ** failed to get the online device info **')
+
+            print('==============================================')
+
+            shell_dev = loader
+
+        #
+        # Let's enter the shell!
+        #
+        ds = DasShell(shell_dev, rom=rom_mode, cipher=mem_cipher)
+
+        if len(args.cmds) > 0:
+            # just execute commands in order
+            for cmd in args.cmds:
+                if ds.onecmd(cmd):
+                    if not any(cmd.strip().startswith(x) for x in ['reset', 'exit']):
+                        print('**** interrupted ****')
+                    break
+        else:
+            # enter the shell
+            ds.cmdloop()
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

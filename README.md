@@ -27,9 +27,30 @@ Here is an overview of some important commands:
 - `dump <address> [<length>]`: Hex dump `<length>` bytes of flash at `<address>`
   * If length is unspecified, then it defaults to 256 bytes
 
+Memory (as opposed to flash) commands work in both modes:
+
+- `memread <address> <length> <file>`: Read memory into `<file>`
+- `memdump <address> [<length>]`: Hex dump memory
+- `memwrite <address> <file>`: Write `<file>` into memory
+- `memjump <address> [<arg>]`: Execute the code at `<address>`
+
+With `--no-loader` none of the flash commands exist, because the chip is still
+in its mask ROM: see [Memory dump without the loader](#memory-dump-without-the-loader).
+
 ### jlrunner.py
 
 A simple script that loads a code binary into RAM and executes it with an optionally given numeric argument.
+
+It also dumps memory on its own, without loading or executing anything:
+
+```sh
+jlrunner.py --device /dev/sg2 --dump 0x20040 --length 0x1000 --encrypt --out console.bin
+jlrunner.py --device /dev/sg2 --dump 0x21080 --length 0x2dc        # hexdump to stdout
+```
+
+`--dumpaddr` is a different feature: it hexdumps 64 bytes before the jump and
+256 after it, so code that resets or hangs only ever shows the first. `--dump`
+only reads, and returns.
 
 ### jldevfind.py
 
@@ -82,6 +103,44 @@ Chip series it's currently aware of are listed below:
 | BR36   | (AC/JL)700N           | n/a           | no loaders for it yet |
 | WL80   | AC790N                | unknown       |                    |
 | WL82   | AC791N                | unknown       |                    |
+
+## Memory dump without the loader
+
+The mask ROM's `FD07` reads memory by itself, so a dump needs no loader upload
+and no code execution. That is the only way to read RAM after a payload that
+reset or hung: the loader path writes 11 KiB of loader into RAM first, and it
+overwrites `0x12000..0x14BFF`.
+
+```sh
+# Mask ROM, nothing written, nothing executed
+jlrunner.py --device /dev/sg2 --dump 0x20040 --length 0x1000 --encrypt --out console.bin
+
+# The same region through the loader, for comparison (installs br23loader)
+jluboottool.py --device /dev/sg2 --chip br23 "memread 0x20040 0x1000 loader.bin"
+cmp console.bin loader.bin
+```
+
+Two things to know:
+
+- **BR23 and up scramble memory transfers** (the `memory-rw-mengli-crypt` quirk
+  in `data/chips.yaml`), and `CrcDecode` re-seeds its keystream per transfer, so
+  the scrambling applies to **each transfer separately** and a transfer must stay
+  within the chip's 256-byte memory buffer. `--encrypt` undoes it on reads and
+  applies it on writes; `jltech/memio.py` holds the rule for all three call sites.
+- **Flash still needs the loader.** `read`/`write`/`erase`/`dump` are loader
+  commands, so with `--no-loader` they refuse instead of failing on the wire.
+
+`jluboottool.py --no-loader` gives the same thing from the shell, and picks the
+scrambling from the chip's quirks automatically:
+
+```sh
+jluboottool.py --device /dev/sg2 --chip br23 --no-loader \
+    "memread 0x20040 0x1000 console.bin" "memdump 0x21080 0x20"
+```
+
+Pass `--raw` if a loader is already resident in the same power cycle: it answers
+`FD07` with plain bytes. The INQUIRY string cannot tell you which is answering --
+it says `UBOOT1.00` either way.
 
 ## See also
 
